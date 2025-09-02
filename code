@@ -1,1 +1,516 @@
+#include <ESP8266WiFi.h>
+#include <ESP8266WebServer.h>
+#include <ESP8266HTTPUpdateServer.h>
+#include <EEPROM.h>
+#include <IRremoteESP8266.h>
+#include <IRrecv.h>
+#include <IRutils.h>
+#include <DHT.h>
+#include <WiFiUdp.h>
+#include <ArduinoOTA.h>
 
+// Pin define
+#define DHTPIN 14
+#define DHTTYPE DHT11
+#define IR_RECEIVE_PIN 12
+
+//Memory Space define
+#define EEPROM_SSID_ADDR 0 
+#define EEPROM_PASSWORD_ADDR 32
+#define EEPROM_RELAY_STATES_ADDR 64
+#define EEPROM_IR_CODES_ADDR 128
+
+char ssid[32] = "";
+char password[32] = "";
+const int relayPins[] = {2, 13, 0, 1};
+const int switchPins[] = {3, 10, 5, 4};
+bool relayStates[4] = {false, false, false, false};
+bool switchStates[4] = {HIGH, HIGH, HIGH, HIGH};
+bool lastSwitchStates[4] = {HIGH, HIGH, HIGH, HIGH};
+unsigned long relayIRCodes[4] = {0, 0, 0, 0};
+unsigned long irSetupStartTime = 0;
+int currentIrSetupRelay = -1;
+
+DHT dht(DHTPIN, DHTTYPE);
+IRrecv irrecv(IR_RECEIVE_PIN);
+decode_results results;
+ESP8266WebServer server(80);
+ESP8266HTTPUpdateServer httpUpdater;
+
+// All the Functions
+String readStringFromEEPROM(int startAddr, int maxLen);
+void handleRoot();
+void handleToggle();
+void handleSetupRemote();
+void handleSetIR();
+void handleResetIR();
+void handleWifiSetup();
+void handleSaveWifi();
+void startConfigurationAP();
+void connectToWiFi();
+void writeStringToEEPROM(int addr, const String &data);
+void updateToggleSwitches();
+void setupOTA();
+
+
+//At boot
+void setup() {
+  Serial.begin(115200);
+  while (!Serial);
+  Serial.println("\n\nBooting...");
+
+  EEPROM.begin(512);
+
+  String savedSSID = readStringFromEEPROM(EEPROM_SSID_ADDR, 32);
+  String savedPassword = readStringFromEEPROM(EEPROM_PASSWORD_ADDR, 32);
+
+  if (savedSSID.length() > 0 && savedPassword.length() > 0) {
+    savedSSID.toCharArray(ssid, 32);
+    savedPassword.toCharArray(password, 32);
+    Serial.println("\nLoaded credentials from EEPROM");
+    connectToWiFi();
+  } else {
+    Serial.println("No WiFi credentials found");
+    startConfigurationAP();
+  }
+
+  server.on("/", handleRoot);
+  server.on("/wifi_setup", HTTP_GET, handleWifiSetup);
+  server.on("/save_wifi", HTTP_POST, handleSaveWifi);
+  server.on("/toggle", handleToggle);
+  server.on("/setup_remote", handleSetupRemote);
+  server.on("/set_ir", HTTP_GET, handleSetIR);
+  server.on("/reset_ir", handleResetIR);
+  
+  httpUpdater.setup(&server);
+  setupOTA();
+  
+  server.begin();
+
+  for (int i = 0; i < 4; i++) {
+    relayStates[i] = EEPROM.read(EEPROM_RELAY_STATES_ADDR + i);
+    relayIRCodes[i] = EEPROM.get(EEPROM_IR_CODES_ADDR + (i * sizeof(unsigned long)), relayIRCodes[i]);
+    digitalWrite(relayPins[i], relayStates[i] ? LOW : HIGH);
+  }
+
+  for (int i = 0; i < 4; i++) {
+    pinMode(relayPins[i], OUTPUT);
+    digitalWrite(relayPins[i], relayStates[i] ? LOW : HIGH);
+    pinMode(switchPins[i], INPUT_PULLUP);
+    switchStates[i] = digitalRead(switchPins[i]);
+    lastSwitchStates[i] = switchStates[i];
+  }
+  
+  dht.begin();
+  irrecv.enableIRIn();
+}
+
+void loop() {
+  server.handleClient();
+  ArduinoOTA.handle();
+  updateToggleSwitches();
+
+  if (currentIrSetupRelay != -1 && millis() - irSetupStartTime > 30000) {
+    currentIrSetupRelay = -1;
+    Serial.println("IR setup timed out");
+  }
+
+  if (irrecv.decode(&results)) {
+    unsigned long receivedCode = results.value;
+    Serial.print("IR Code: ");
+    Serial.println(receivedCode, HEX);
+
+    if (currentIrSetupRelay != -1) {
+      relayIRCodes[currentIrSetupRelay] = receivedCode;
+      EEPROM.put(EEPROM_IR_CODES_ADDR + (currentIrSetupRelay * sizeof(unsigned long)), receivedCode);
+      EEPROM.commit();
+      currentIrSetupRelay = -1;
+    } else {
+      for (int i = 0; i < 4; i++) {
+        if (relayIRCodes[i] == receivedCode) {
+          relayStates[i] = !relayStates[i];
+          digitalWrite(relayPins[i], relayStates[i] ? LOW : HIGH);
+          EEPROM.write(EEPROM_RELAY_STATES_ADDR + i, relayStates[i]);
+          EEPROM.commit();
+        }
+      }
+    }
+    irrecv.resume();
+  }
+}
+
+void setupOTA() {
+  ArduinoOTA.setHostname("esp-relay-controller");
+  
+  ArduinoOTA.onStart([]() {
+    String type;
+    if (ArduinoOTA.getCommand() == U_FLASH) {
+      type = "sketch";
+    } else { // U_SPIFFS
+      type = "filesystem";
+    }
+    Serial.println("Start updating " + type);
+  });
+  
+  ArduinoOTA.onEnd([]() {
+    Serial.println("\nEnd");
+  });
+  
+  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+    Serial.printf("Progress: %u%%\r", (progress / (total / 100)));
+  });
+  
+  ArduinoOTA.onError([](ota_error_t error) {
+    Serial.printf("Error[%u]: ", error);
+    if (error == OTA_AUTH_ERROR) Serial.println("Auth Failed");
+    else if (error == OTA_BEGIN_ERROR) Serial.println("Begin Failed");
+    else if (error == OTA_CONNECT_ERROR) Serial.println("Connect Failed");
+    else if (error == OTA_RECEIVE_ERROR) Serial.println("Receive Failed");
+    else if (error == OTA_END_ERROR) Serial.println("End Failed");
+  });
+  
+  ArduinoOTA.begin();
+}
+
+void updateToggleSwitches() {
+  for (int i = 0; i < 4; i++) {
+    bool currentState = digitalRead(switchPins[i]);
+    
+    if (currentState != lastSwitchStates[i]) {
+      delay(50); // Debounce delay
+      
+      if (digitalRead(switchPins[i]) == currentState) {
+        relayStates[i] = (currentState == LOW);
+        digitalWrite(relayPins[i], relayStates[i] ? LOW : HIGH);
+        EEPROM.write(EEPROM_RELAY_STATES_ADDR + i, relayStates[i]);
+        EEPROM.commit();
+        
+        Serial.print("Toggle Switch ");
+        Serial.print(i);
+        Serial.print(" set to: ");
+        Serial.println(relayStates[i] ? "ON" : "OFF");
+        
+        lastSwitchStates[i] = currentState;
+      }
+    }
+  }
+}
+
+void connectToWiFi() {
+  Serial.print("Connecting to ");
+  Serial.println(ssid);
+  
+  WiFi.disconnect();
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+  
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nConnected! IP: ");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("\nConnection failed");
+    startConfigurationAP();
+  }
+}
+
+void startConfigurationAP() {
+  WiFi.disconnect();
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP("ESP_Config", "config123");
+  Serial.println("AP Mode: ESP_Config/config123");
+  Serial.print("AP IP: ");
+  Serial.println(WiFi.softAPIP());
+}
+
+void writeStringToEEPROM(int addr, const String &data) {
+  for (unsigned int i = 0; i < data.length(); i++) {
+    EEPROM.write(addr + i, data[i]);
+  }
+  EEPROM.write(addr + data.length(), '\0');
+  EEPROM.commit();
+}
+
+String readStringFromEEPROM(int addr, int maxLen) {
+  String result;
+  for (int i = 0; i < maxLen; i++) {
+    byte val = EEPROM.read(addr + i);
+    if (val == 0 || val == 255) break;
+    result += (char)val;
+  }
+  return result;
+}
+
+void handleRoot() {
+  String html = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+body {font-family:Arial; text-align:center; margin:20px;}
+button {padding:12px 24px; margin:8px; border-radius:6px; border:none; cursor:pointer; font-size:16px;}
+.btn-on {background:#e74c3c; color:white;}
+.btn-off {background:#2ecc71; color:white;}
+.btn-config {background:#3498db; color:white;}
+.btn-update {background:#9b59b6; color:white;}
+.relay-box {display:inline-block; padding:15px; margin:10px; border-radius:8px; background:#f8f9fa;}
+.status {margin:15px; font-size:18px;}
+.wifi-status {padding:10px; margin:15px auto; max-width:300px; border-radius:6px; background:#f1f1f1;}
+.sensor-box {padding:15px; margin:20px auto; max-width:300px; border-radius:8px; background:#e8f4f8;}
+.switch-status {padding:15px; margin:20px auto; max-width:300px; border-radius:8px; background:#f0e6ff;}
+.update-box {padding:15px; margin:20px auto; max-width:300px; border-radius:8px; background:#fdebd0;}
+</style>
+</head>
+<body>
+<h1>Relay Control System</h1>
+<div class="wifi-status">
+  <p>WiFi: )rawliteral";
+  
+  html += (WiFi.status() == WL_CONNECTED) ? 
+    "Connected to " + String(ssid) + "<br>IP: " + WiFi.localIP().toString() : 
+    "Not connected (AP Mode)";
+  
+  html += R"rawliteral(</p>
+  <a href="/wifi_setup"><button class="btn-config">WiFi Setup</button></a>
+</div>)rawliteral";
+
+  // DHT11 Sensor Readings
+  float temperature = dht.readTemperature();
+  float humidity = dht.readHumidity();
+  
+  if (!isnan(temperature) && !isnan(humidity)) {
+    html += R"rawliteral(
+    <div class="sensor-box">
+      <h3>Environment Sensor</h3>
+      <p>Temperature: )rawliteral" + String(temperature) + R"rawliteral(°C</p>
+      <p>Humidity: )rawliteral" + String(humidity) + R"rawliteral(%</p>
+    </div>)rawliteral";
+  }
+
+  //Mechanial Switch
+  html += R"rawliteral(<div class="switch-status"><h3>Toggle Switches</h3>)rawliteral";
+  for (int i = 0; i < 4; i++) {
+    html += "<p>Switch " + String(i+1) + ": ";
+    html += "<span style='color:" + String(switchStates[i] == LOW ? "green" : "red") + "'>";
+    html += switchStates[i] == LOW ? "ON" : "OFF";
+    html += "</span> Relay " + String(i+1) + ": ";
+    html += "<span style='color:" + String(relayStates[i] ? "green" : "red") + "'>";
+    html += relayStates[i] ? "ON" : "OFF";
+    html += "</span></p>";
+  }
+  html += "</div>";
+
+  // Relay Controls
+  for (int i = 0; i < 4; i++) {
+    html += "<div class='relay-box'><h2>Relay " + String(i+1) + "</h2>";
+    html += "<p>State: <span style='color:" + String(relayStates[i]?"green":"red") + "'>";
+    html += relayStates[i] ? "ON" : "OFF";
+    html += "</span></p>";
+    html += "<button class='" + String(relayStates[i]?"btn-on":"btn-off") + "' ";
+    html += "onclick=\"location.href='/toggle?relay=" + String(i) + "'\">";
+    html += relayStates[i] ? "TURN OFF" : "TURN ON";
+    html += "</button></div>";
+  }
+
+  // OTA
+  html += R"rawliteral(
+  <div class="update-box">
+    <h3>Firmware Update</h3>
+    <p>Update device firmware over-the-air</p>
+    <a href="/update"><button class="btn-update">OTA Update</button></a>
+  </div>
+  )rawliteral";
+
+  html += "<div><a href='/setup_remote'><button class='btn-config'>Remote Setup</button></a></div>";
+  html += "</body></html>";
+  server.send(200, "text/html", html);
+}
+
+void handleToggle() {
+  if (server.hasArg("relay")) {
+    int r = server.arg("relay").toInt();
+    if (r >= 0 && r < 4) {
+      relayStates[r] = !relayStates[r];
+      digitalWrite(relayPins[r], relayStates[r] ? LOW : HIGH);
+      EEPROM.write(EEPROM_RELAY_STATES_ADDR + r, relayStates[r]);
+      EEPROM.commit();
+    }
+  }
+  handleRoot();
+}
+
+void handleSetupRemote() {
+  String html = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+body {font-family:Arial; text-align:center; margin:20px;}
+button {padding:10px 20px; margin:8px; border-radius:6px; border:none; cursor:pointer;}
+.btn-set {background:#3498db; color:white;}
+.btn-reset {background:#e67e22; color:white;}
+.remote-box {display:inline-block; padding:15px; margin:10px; border-radius:8px; background:#f8f9fa;}
+</style>
+</head>
+<body>
+<h1>Remote Setup</h1>)rawliteral";
+
+  for (int i = 0; i < 4; i++) {
+    html += "<div class='remote-box'><h2>Relay " + String(i+1) + "</h2>";
+    html += "<p>Current Code: " + String(relayIRCodes[i], HEX) + "</p>";
+    html += "<a href='/set_ir?relay=" + String(i) + "'><button class='btn-set'>Set Code</button></a>";
+    html += "<a href='/reset_ir?relay=" + String(i) + "'><button class='btn-reset'>Reset</button></a>";
+    html += "</div>";
+  }
+
+  html += "</body></html>";
+  server.send(200, "text/html", html);
+}
+
+void handleSetIR() {
+  if (!server.hasArg("relay")) {
+    server.send(400, "text/plain", "Missing relay parameter");
+    return;
+  }
+  
+  int r = server.arg("relay").toInt();
+  if (r < 0 || r >= 4) {
+    server.send(400, "text/plain", "Invalid relay");
+    return;
+  }
+
+  currentIrSetupRelay = r;
+  irSetupStartTime = millis();
+
+  String html = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+body {font-family:Arial; text-align:center; margin:20px;}
+.status {font-size:20px; margin:20px;}
+.timeout {color:#666; margin:15px;}
+</style>
+</head>
+<body>
+<h1>Setup Relay )rawliteral" + String(r+1) + R"rawliteral(</h1>
+<div class="status">Point remote at device and press button</div>
+<div class="status" id="status">Waiting for IR signal...</div>
+<div class="timeout" id="timeout">Time remaining: 30 seconds</div>
+<script>
+let timeLeft = 30;
+function update() {
+  timeLeft--;
+  document.getElementById('timeout').innerHTML = 'Time remaining: ' + timeLeft + ' seconds';
+  if (timeLeft <= 0) {
+    document.getElementById('status').innerHTML = 'Timeout!';
+    setTimeout(() => location.href='/setup_remote', 2000);
+  }
+  fetch(location.href + '&check=1').then(r => r.text()).then(t => {
+    if (t.includes('SUCCESS')) location.href='/setup_remote';
+  });
+}
+setInterval(update, 1000);
+</script>
+</body>
+</html>)rawliteral";
+
+  server.send(200, "text/html", html);
+  
+  if (server.hasArg("check")) {
+    server.send(200, "text/plain", currentIrSetupRelay == -1 ? "SUCCESS" : "WAITING");
+  }
+}
+
+void handleResetIR() {
+  if (server.hasArg("relay")) {
+    int r = server.arg("relay").toInt();
+    if (r >= 0 && r < 4) {
+      relayIRCodes[r] = 0;
+      EEPROM.put(EEPROM_IR_CODES_ADDR + (r * sizeof(unsigned long)), 0);
+      EEPROM.commit();
+    }
+  }
+  handleSetupRemote();
+}
+
+void handleWifiSetup() {
+  String html = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+body {font-family:Arial; max-width:400px; margin:0 auto; padding:20px;}
+.form-group {margin-bottom:15px;}
+label {display:block; margin-bottom:5px; font-weight:bold;}
+input {width:100%; padding:10px; box-sizing:border-box; border:1px solid #ddd; border-radius:4px;}
+button {background:#3498db; color:white; border:none; padding:12px; width:100%; cursor:pointer; border-radius:4px; font-size:16px;}
+</style>
+</head>
+<body>
+<h2>WiFi Setup</h2>
+<form method="post" action="/save_wifi">
+  <div class="form-group">
+    <label for="ssid">WiFi Name</label>
+    <input type="text" id="ssid" name="ssid" required>
+  </div>
+  <div class="form-group">
+    <label for="password">Password</label>
+    <input type="password" id="password" name="password" required>
+  </div>
+  <button type="submit">Save & Connect</button>
+</form>
+</body>
+</html>)rawliteral";
+
+  server.send(200, "text/html", html);
+}
+
+void handleSaveWifi() {
+  if (!server.hasArg("ssid") || !server.hasArg("password")) {
+    server.send(400, "text/plain", "Missing credentials");
+    return;
+  }
+
+  String newSSID = server.arg("ssid");
+  String newPass = server.arg("password");
+
+  writeStringToEEPROM(EEPROM_SSID_ADDR, newSSID);
+  writeStringToEEPROM(EEPROM_PASSWORD_ADDR, newPass);
+  
+  newSSID.toCharArray(ssid, 32);
+  newPass.toCharArray(password, 32);
+
+  String html = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+<meta http-equiv="refresh" content="5;url=/">
+<style>
+body {font-family:Arial; text-align:center; padding:20px;}
+.success {color:#2ecc71; margin-top:30px;}
+</style>
+</head>
+<body>
+<div class="success">
+  <h1>WiFi Settings Saved!</h1>
+  <p>Connecting to: )rawliteral" + newSSID + R"rawliteral(</p>
+  <p>Device will restart...</p>
+</div>
+</body>
+</html>)rawliteral";
+
+  server.send(200, "text/html", html);
+  delay(2000);
+  ESP.restart();
+}
